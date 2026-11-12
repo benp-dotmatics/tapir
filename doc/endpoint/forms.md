@@ -120,6 +120,7 @@ is read only as fast as the events are consumed.
 Streaming multipart parsing is currently supported by the following server interpreters:
 
 * pekko-http: see [`PekkoMultipartStreams`](../server/pekkohttp.md#streaming-multipart-forms)
+* akka-http: see [`AkkaMultipartStreams`](../server/akkahttp.md#streaming-multipart-forms)
 
 ```{note}
 Since the parts arrive one after another, the body of a part has to be consumed (or skipped) before the next part

@@ -86,6 +86,32 @@ capability. Both response bodies and request bodies can be streamed. Usage: `str
 The capability can be added to the classpath independently of the interpreter through the 
 `"com.softwaremill.sttp.shared" %% "akka"` dependency.
 
+```{note}
+By default, akka-http fails reading request bodies sent using chunked transfer encoding, which contain a chunk larger
+than 1MB. When the body is a stream, this results in an internal server error response. The limit can be changed using
+the `akka.http.server.parsing.max-chunk-size` configuration setting.
+```
+
+### Streaming multipart forms
+
+Multipart bodies can be processed as they arrive, without buffering the parts in memory or in temporary files (see
+[streaming multipart forms](../endpoint/forms.md#streaming-multipart-forms)). `AkkaMultipartStreams.parse` turns the
+multipart boundary and the raw request body into a stream of events: `Left(part)` marks the start of each part, followed
+by `Right(bytes)` chunks of its body:
+
+```scala
+endpoint.post
+  .in("upload")
+  .in(multipartBoundary)
+  .in(streamBody(AkkaStreams)(Schema.binary, CodecFormat.MultipartFormData()))
+  .serverLogicSuccess[Future] { case (boundary, body) =>
+    AkkaMultipartStreams.parse(boundary, body).runWith(...)
+  }
+```
+
+The `singlePart(name)`, `foreachPart(handler)` and `groupParts` helpers are also available, and work the same as their
+[pekko-http counterparts](pekkohttp.md#streaming-multipart-forms).
+
 ## Web sockets
 
 The interpreter supports web sockets, with pipes of type `Flow[REQ, RESP, Any]`. See [web sockets](../endpoint/websockets.md) 
