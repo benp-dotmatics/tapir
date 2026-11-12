@@ -88,6 +88,47 @@ When receiving a multipart request in a Tapir server, any files created to store
 the request processing completes (regardless of the outcome - HTTP success, HTTP failure or exception).
 ```
 
+## Streaming multipart forms
+
+When using `multipartBody`, all parts are read (into memory or temporary files) before the server logic is invoked. If
+the parts are large, and should be processed as they arrive - e.g. uploaded directly to an object store - the multipart
+body can instead be received as a raw [stream](streaming.md), and parsed using a streams-specific multipart parser.
+
+To do that, combine the `multipartBoundary` input, which reads the boundary from the `Content-Type` header, with a
+streaming body:
+
+```scala mdoc:compile-only
+import sttp.tapir.*
+import sttp.capabilities.pekko.PekkoStreams
+
+endpoint.post
+  .in("upload")
+  .in(multipartBoundary)
+  .in(streamBody(PekkoStreams)(Schema.binary, CodecFormat.MultipartFormData()))
+// : Endpoint[Unit, (String, Source[ByteString, Any]), Unit, Unit, PekkoStreams]
+```
+
+If the request's content type isn't `multipart/form-data`, a `415 Unsupported Media Type` response is returned; if the
+boundary is missing, the response is a `400 Bad Request`. The schema given to `streamBody` is only used for documentation,
+and can describe the expected parts, e.g. `Schema.derived[MyForm]`.
+
+The boundary and raw stream are then passed to a multipart parser, which turns them into a flat stream of events: the
+start of each part, with its name, file name, content type and headers (`Left(part: Part[Unit])`), followed by chunks of
+the part's body (`Right(bytes)`). Parts are emitted in the order in which they appear in the request, and the request body
+is read only as fast as the events are consumed.
+
+Streaming multipart parsing is currently supported by the following server interpreters:
+
+* pekko-http: see [`PekkoMultipartStreams`](../server/pekkohttp.md#streaming-multipart-forms)
+
+```{note}
+Since the parts arrive one after another, the body of a part has to be consumed (or skipped) before the next part
+becomes available. Hence, parts cannot be processed in parallel, unless they're buffered. 
+
+As the body is parsed by the server logic, any parsing errors happen there as well. These are reported as an
+`InvalidMultipartBodyException`, which, if it propagates, is by default handled by responding with a `400 Bad Request`.
+```
+
 ## Next
 
 Read on about [security](security.md).

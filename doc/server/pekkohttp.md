@@ -86,6 +86,61 @@ capability. Both response bodies and request bodies can be streamed. Usage: `str
 The capability can be added to the classpath independently of the interpreter through the 
 `"com.softwaremill.sttp.shared" %% "pekko"` dependency.
 
+```{note}
+By default, pekko-http fails reading request bodies sent using chunked transfer encoding, which contain a chunk larger
+than 1MB. When the body is a stream, this results in an internal server error response. The limit can be changed using
+the `pekko.http.server.parsing.max-chunk-size` configuration setting.
+```
+
+### Streaming multipart forms
+
+Multipart bodies can be processed as they arrive, without buffering the parts in memory or in temporary files (see
+[streaming multipart forms](../endpoint/forms.md#streaming-multipart-forms)). `PekkoMultipartStreams.parse` turns the
+multipart boundary and the raw request body into a stream of events: `Left(part)` marks the start of each part, followed
+by `Right(bytes)` chunks of its body. The following helpers can be used to further process the events:
+
+* `singlePart(name)`: extracts the body of a single part, skipping the others. The remainder of the request isn't read
+  once the part ends. If there's no such part, the stream fails with an `InvalidMultipartBodyException`
+* `foreachPart(handler)`: runs the body of each part using a `Sink` created by the given handler, emitting the results
+* `groupParts`: emits each part along with a source of its body bytes; the source must be run before the next part is
+  emitted
+
+For example, to stream each uploaded file to a destination, collecting the remaining parts as text fields:
+
+```scala mdoc:compile-only
+import org.apache.pekko.Done
+import org.apache.pekko.stream.Materializer
+import org.apache.pekko.stream.scaladsl.Sink
+import org.apache.pekko.util.ByteString
+import sttp.capabilities.pekko.PekkoStreams
+import sttp.tapir.*
+import sttp.tapir.server.ServerEndpoint
+import sttp.tapir.server.pekkohttp.PekkoMultipartStreams
+
+import scala.concurrent.{ExecutionContext, Future}
+
+def upload(fileName: String): Sink[ByteString, Future[Done]] = ???
+
+def uploadEndpoint(implicit mat: Materializer, ec: ExecutionContext): ServerEndpoint[PekkoStreams, Future] =
+  endpoint.post
+    .in("upload")
+    .in(multipartBoundary)
+    .in(streamBody(PekkoStreams)(Schema.binary, CodecFormat.MultipartFormData()))
+    .out(stringBody)
+    .serverLogicSuccess[Future] { case (boundary, body) =>
+      PekkoMultipartStreams
+        .parse(boundary, body)
+        .via(PekkoMultipartStreams.foreachPart[String] {
+          case p if p.fileName.isDefined =>
+            upload(p.fileName.get).mapMaterializedValue(_.map(_ => s"${p.name}: uploaded"))
+          case p => 
+            Sink.fold[ByteString, ByteString](ByteString.empty)(_ ++ _).mapMaterializedValue(_.map(v => s"${p.name}: ${v.utf8String}"))
+        })
+        .runWith(Sink.seq)
+        .map(_.map(_._2).mkString("\n"))
+    }
+```
+
 ## Web sockets
 
 The interpreter supports web sockets, with pipes of type `Flow[REQ, RESP, Any]`. See [web sockets](../endpoint/websockets.md) 

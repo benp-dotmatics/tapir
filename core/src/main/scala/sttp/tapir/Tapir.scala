@@ -126,6 +126,29 @@ trait Tapir extends TapirExtensions with TapirComputedInputs with TapirStaticCon
   def multipartBody[T](implicit multipartCodec: MultipartCodec[T]): EndpointIO.Body[Seq[RawPart], T] =
     EndpointIO.Body(multipartCodec.rawBodyType, multipartCodec.codec, EndpointIO.Info.empty)
 
+  /** Reads the multipart boundary from the `Content-Type` header. Decoding fails if the content type isn't `multipart/form-data`, or if the
+    * boundary parameter is missing.
+    *
+    * Use it together with a streaming body, e.g. `streamBody(streams)(schema, CodecFormat.MultipartFormData())`, to get a raw multipart
+    * byte stream and the boundary needed to parse it with a streams-specific multipart parser. Unlike [[multipartBody]], this doesn't
+    * buffer any parts before the server logic runs.
+    *
+    * When encoding (e.g. in clients), the boundary is written as `Content-Type: multipart/form-data; boundary=...`. The header isn't
+    * included in documentation, because it duplicates the body's content type.
+    */
+  def multipartBoundary: EndpointIO.Header[String] =
+    header[MediaType](HeaderNames.ContentType)
+      .mapDecode { mt =>
+        if (!mt.isMultipart || !mt.subType.equalsIgnoreCase("form-data"))
+          DecodeResult.Mismatch(MediaType.MultipartFormData.toString, mt.toString)
+        else
+          mt.otherParameters.collectFirst { case (k, v) if k.equalsIgnoreCase("boundary") && v.nonEmpty => v } match {
+            case Some(boundary) => DecodeResult.Value(boundary)
+            case None           => DecodeResult.Error(mt.toString, new IllegalArgumentException("Missing multipart boundary"))
+          }
+      }(boundary => MediaType.MultipartFormData.copy(otherParameters = Map("boundary" -> boundary)))
+      .schema(_.hidden(true))
+
   /** Creates a stream body with a binary schema.
     * @param format
     *   The media type to use by default. Can be later overridden by providing a custom `Content-Type` header.

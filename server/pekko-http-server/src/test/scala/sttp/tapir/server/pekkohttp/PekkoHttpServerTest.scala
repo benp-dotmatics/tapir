@@ -20,7 +20,9 @@ import sttp.model.StatusCode
 import sttp.monad.FutureMonad
 import sttp.monad.syntax._
 import sttp.tapir._
+import sttp.tapir.server.ServerEndpoint
 import sttp.tapir.server.interceptor._
+import sttp.tapir.server.model.MaxContentLength
 import sttp.tapir.server.interceptor.metrics.MetricsRequestInterceptor
 import sttp.tapir.server.metrics.{EndpointMetric, Metric}
 import sttp.tapir.server.tests._
@@ -221,6 +223,121 @@ class PekkoHttpServerTest extends TestSuite with EitherValues {
             .unsafeToFuture()
         }
       )
+      def multipartStreamingTests(): List[Test] = {
+
+        // summarises each part as name[fileName]:contentType=byteCount
+        val uploadEndpoint = endpoint.post
+          .in("upload")
+          .in(multipartBoundary)
+          .in(streamBody(PekkoStreams)(Schema.binary, CodecFormat.MultipartFormData()))
+          .out(stringBody)
+
+        def summarise(boundary: String, body: PekkoStreams.BinaryStream): Future[String] =
+          PekkoMultipartStreams
+            .parse(boundary, body)
+            .runFold(Vector.empty[(String, Long)]) {
+              case (acc, Left(part)) =>
+                acc :+ (s"${part.name}${part.fileName.fold("")(f => s"[$f]")}:${part.contentType.getOrElse("")}" -> 0L)
+              case (acc, Right(bytes)) => acc.init :+ (acc.last._1 -> (acc.last._2 + bytes.size))
+            }
+            .map(_.map { case (p, size) => s"$p=$size" }.mkString(";"))
+
+        def serve(e: ServerEndpoint[PekkoStreams, Future])(test: Int => IO[org.scalatest.Assertion]): Future[org.scalatest.Assertion] =
+          interpreter.server(PekkoHttpServerInterpreter().toRoute(e)).use(test).unsafeToFuture()
+
+        val summariseEndpoint = uploadEndpoint.serverLogicSuccess[Future] { case (boundary, body) => summarise(boundary, body) }
+
+        List(
+          Test("streaming multipart: parse a multipart body sent by a client") {
+            // < 1MB: the test client sends the body as a single HTTP chunk, and pekko-http limits chunks to 1MB by default
+            val fileSize = 512 * 1024
+            serve(summariseEndpoint) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .multipartBody(
+                  multipart("a", "hello"),
+                  multipart("f", Array.fill[Byte](fileSize)('x'.toByte)).fileName("big.bin").contentType(MediaType.ApplicationOctetStream)
+                )
+                .send(backend)
+                .map { r =>
+                  r.code shouldBe StatusCode.Ok
+                  r.body shouldBe Right(s"a:text/plain; charset=UTF-8=5;f[big.bin]:application/octet-stream=$fileSize")
+                }
+            }
+          },
+          Test("streaming multipart: extract a single part") {
+            val e = uploadEndpoint.serverLogicSuccess[Future] { case (boundary, body) =>
+              PekkoMultipartStreams.parse(boundary, body).via(PekkoMultipartStreams.singlePart("f")).runFold(0L)(_ + _.size).map(_.toString)
+            }
+            serve(e) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .multipartBody(
+                  multipart("a", "hello"),
+                  multipart("f", Array.fill[Byte](1000)('x'.toByte)).fileName("f.bin"),
+                  multipart("b", "x")
+                )
+                .send(backend)
+                .map(_.body shouldBe Right("1000"))
+            }
+          },
+          Test("streaming multipart: 400 when a required part is missing") {
+            val e = uploadEndpoint.serverLogicSuccess[Future] { case (boundary, body) =>
+              PekkoMultipartStreams.parse(boundary, body).via(PekkoMultipartStreams.singlePart("f")).runFold(0L)(_ + _.size).map(_.toString)
+            }
+            serve(e) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .multipartBody(multipart("a", "hello"))
+                .send(backend)
+                .map(_.code shouldBe StatusCode.BadRequest)
+            }
+          },
+          Test("streaming multipart: 400 when the boundary is missing") {
+            serve(summariseEndpoint) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .body("--x\r\n")
+                .contentType("multipart/form-data")
+                .send(backend)
+                .map(_.code shouldBe StatusCode.BadRequest)
+            }
+          },
+          Test("streaming multipart: 415 when the content type isn't multipart/form-data") {
+            serve(summariseEndpoint) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .body("hello")
+                .contentType(MediaType.TextPlain)
+                .send(backend)
+                .map(_.code shouldBe StatusCode.UnsupportedMediaType)
+            }
+          },
+          Test("streaming multipart: 400 when the body is malformed") {
+            serve(summariseEndpoint) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .body("--b\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nhello, cut off here")
+                .contentType("multipart/form-data; boundary=b")
+                .send(backend)
+                .map(_.code shouldBe StatusCode.BadRequest)
+            }
+          },
+          Test("streaming multipart: 413 when the body exceeds the max content length") {
+            val e = uploadEndpoint
+              .attribute(AttributeKey[MaxContentLength], MaxContentLength(1024L))
+              .serverLogicSuccess[Future] { case (boundary, body) => summarise(boundary, body) }
+            serve(e) { port =>
+              basicRequest
+                .post(uri"http://localhost:$port/upload")
+                .multipartBody(multipart("f", Array.fill[Byte](16 * 1024)('x'.toByte)).fileName("big.bin"))
+                .send(backend)
+                .map(_.code shouldBe StatusCode.PayloadTooLarge)
+            }
+          }
+        )
+      }
+
       def drainPekko(stream: PekkoStreams.BinaryStream): Future[Unit] =
         stream.runWith(Sink.ignore).map(_ => ())
 
@@ -239,7 +356,8 @@ class PekkoHttpServerTest extends TestSuite with EitherValues {
           override def functionToPipe[A, B](f: A => B): streams.Pipe[A, B] = Flow.fromFunction(f)
           override def emptyPipe[A, B]: Flow[A, B, Any] = Flow.fromSinkAndSource(Sink.ignore, Source.empty)
         }.tests() ++
-        additionalTests()
+        additionalTests() ++
+        multipartStreamingTests()
     }
   }
 }
